@@ -1,0 +1,4 @@
+Fix a deadlock when garbage collection finalizes a :mod:`multiprocessing`
+manager proxy in the same process as its server. Defer local reference-count
+decrements so finalizers do not block the server's accepter thread or wait
+while holding the server's mutex.

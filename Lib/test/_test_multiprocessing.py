@@ -3916,6 +3916,114 @@ class _TestManagerRestart(BaseTestCase):
                 self.addCleanup(manager.shutdown)
 
 
+class TestManagerFinalizers(unittest.TestCase):
+
+    @subTests('start_method', ['spawn', 'fork'])
+    def test_remote_server(self, start_method):
+        if start_method not in multiprocessing.get_all_start_methods():
+            self.skipTest(f'{start_method} start method is not supported')
+        code = textwrap.dedent('''
+            import gc
+            import multiprocessing
+            import pickle
+            from multiprocessing.managers import SyncManager
+
+            with SyncManager(address=('127.0.0.1', 0),
+                             ctx=multiprocessing.get_context(METHOD)) as manager:
+                proxy = manager.list([1, 2])
+                copy = pickle.loads(pickle.dumps(proxy))
+                del proxy
+                gc.collect()
+                copy.append(3)
+                assert list(copy) == [1, 2, 3]
+                del copy
+                gc.collect()
+                assert manager._number_of_objects() == 0
+        ''').replace('METHOD', repr(start_method))
+        script_helper.assert_python_ok('-c', code)
+
+    @subTests('collect_in_constructor', [False, True])
+    def test_in_process_server(self, collect_in_constructor):
+        # gh-159986: a proxy finalizer must not block a server thread
+        # waiting for a decref request to that same server.
+        code = textwrap.dedent('''
+            import faulthandler
+            import gc
+            import threading
+            from multiprocessing.managers import BaseManager
+            from test import support
+
+            faulthandler.dump_traceback_later(support.SHORT_TIMEOUT, exit=True)
+            gc.disable()
+            decref_done = threading.Event()
+
+            class Object:
+                def ping(self):
+                    return 42
+
+            class CollectingObject(Object):
+                def __init__(self):
+                    gc.collect()
+
+            class Manager(BaseManager):
+                pass
+
+            Manager.register('Object', Object)
+            Manager.register('CollectingObject', CollectingObject)
+            server = Manager(address=('127.0.0.1', 0),
+                             authkey=b'test').get_server()
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            manager = Manager(address=server.address, authkey=b'test')
+            manager.connect()
+            # Multiple managers can serve different addresses in one process.
+            other_server = Manager(address=('127.0.0.1', 0),
+                                   authkey=b'other').get_server()
+            threading.Thread(target=other_server.serve_forever,
+                             daemon=True).start()
+            other_manager = Manager(address=other_server.address,
+                                    authkey=b'other')
+            other_manager.connect()
+            proxy = manager.Object()
+            assert proxy.ping() == 42
+            ident = proxy._id
+
+            original_decref = server.decref
+            def decref(conn, object_id):
+                original_decref(conn, object_id)
+                if object_id == ident:
+                    decref_done.set()
+            server.decref = decref
+
+            cycle = [proxy]
+            cycle.append(cycle)
+            del proxy, cycle
+        ''')
+        if collect_in_constructor:
+            # Server.create() holds its mutex while calling the constructor.
+            code += "collector = manager.CollectingObject()\n"
+        else:
+            code += textwrap.dedent('''
+                original_accept = server.listener.accept
+                def accept():
+                    conn = original_accept()
+                    gc.collect()
+                    return conn
+                server.listener.accept = accept
+                # The accepter may already be blocked in original_accept().
+                # One request wakes it so the next accept uses the wrapper.
+                manager._number_of_objects()
+                manager._number_of_objects()
+            ''')
+        code += textwrap.dedent('''
+            assert decref_done.wait(support.SHORT_TIMEOUT)
+            assert ident not in server.id_to_refcount
+            assert ident not in server.id_to_obj
+            assert manager._number_of_objects() == EXPECTED
+            faulthandler.cancel_dump_traceback_later()
+        ''').replace('EXPECTED', str(int(collect_in_constructor)))
+        script_helper.assert_python_ok('-c', code)
+
+
 class FakeConnection:
     def send(self, payload):
         pass

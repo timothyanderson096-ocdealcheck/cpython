@@ -164,6 +164,7 @@ class Server(object):
         self.id_to_refcount = {}
         self.id_to_local_proxy_obj = {}
         self.mutex = threading.Lock()
+        self._decref_queue = queue.SimpleQueue()
 
     def serve_forever(self):
         '''
@@ -171,7 +172,13 @@ class Server(object):
         '''
         self.stop_event = threading.Event()
         process.current_process()._manager_server = self
+        servers = process.current_process().__dict__.setdefault(
+            '_manager_servers', {})
+        servers[self.address] = self
         try:
+            decref_thread = threading.Thread(target=self._handle_decrefs,
+                                             daemon=True)
+            decref_thread.start()
             accepter = threading.Thread(target=self.accepter)
             accepter.daemon = True
             accepter.start()
@@ -181,11 +188,21 @@ class Server(object):
             except (KeyboardInterrupt, SystemExit):
                 pass
         finally:
+            if servers.get(self.address) is self:
+                del servers[self.address]
+            self._decref_queue.put(None)
             if sys.stdout != sys.__stdout__: # what about stderr?
                 util.debug('resetting stdout, stderr')
                 sys.stdout = sys.__stdout__
                 sys.stderr = sys.__stderr__
             sys.exit(0)
+
+    def _handle_decrefs(self):
+        while (ident := self._decref_queue.get()) is not None:
+            try:
+                self.decref(None, ident)
+            except Exception as e:
+                util.debug('... decref failed %s', e)
 
     def accepter(self):
         while True:
@@ -884,8 +901,17 @@ class BaseProxy(object):
             # tell manager this process no longer cares about referent
             try:
                 util.debug('DECREF %r', token.id)
-                conn = _Client(token.address, authkey=authkey)
-                dispatch(conn, None, 'decref', (token.id,))
+                servers = getattr(process.current_process(),
+                                  '_manager_servers', {})
+                server = servers.get(token.address)
+                if server is not None:
+                    # GC may run on the accepter thread or while a server
+                    # thread holds its mutex. Neither a request to this
+                    # server nor a direct decref can safely block here.
+                    server._decref_queue.put(token.id)
+                else:
+                    conn = _Client(token.address, authkey=authkey)
+                    dispatch(conn, None, 'decref', (token.id,))
             except Exception as e:
                 util.debug('... decref failed %s', e)
 
